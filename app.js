@@ -1,45 +1,63 @@
-import 'dotenv/config';
+// app.js
 import express from 'express';
 import session from 'express-session';
-import Redis from 'ioredis';
-import { v4 as uuid } from 'uuid';
 import connectRedis from 'connect-redis';
+import { createClient } from 'redis';
+import crypto from 'crypto';
 
-const app = express();
-const redis = new Redis(process.env.REDIS_URL);
+//////////////////////////
+// Redis 설정
+//////////////////////////
 const RedisStore = connectRedis(session);
+const redisClient = createClient({
+  url: process.env.REDIS_URL,
+});
+redisClient.connect().catch(console.error);
 
-app.use(session({
-  store: new RedisStore({ client: redis }),
-  secret: process.env.SESSION_SECRET || 'change-me',
-  resave: false,
-  saveUninitialized: false,
-  cookie: { httpOnly: true, secure: true, maxAge: 1000 * 60 * 60 * 24 * 365 },
-}));
-
-app.use('/admin', (req, res, next) => {
-  const auth = req.headers.authorization || '';
-  if (auth === 'Basic ' + Buffer.from('admin:yourpassword').toString('base64')) return next();
-  res.set('WWW-Authenticate', 'Basic realm="관리자"');
-  return res.status(401).send('인증 필요');
+// 반드시 new 로 인스턴스 생성 (connect-redis v6 문법)
+const store = new RedisStore({
+  client: redisClient,
+  prefix: 'sess:',
 });
 
-app.get('/admin/generate', async (_req, res) => {
-  const token = uuid();
-  await redis.setex(`token:${token}`, 60 * 60, 'valid');
-  res.send(`https://${process.env.DOMAIN}/g/${token}`);
+//////////////////////////
+// Express 앱
+//////////////////////////
+const app = express();
+app.use(express.json());
+
+app.use(
+  session({
+    store,
+    secret: process.env.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: { maxAge: 1000 * 60 * 5 }, // 5분
+  })
+);
+
+// 1회용 토큰 생성 엔드포인트
+app.get('/admin/generate', (req, res) => {
+  const id = crypto.randomBytes(12).toString('hex');
+  redisClient.setEx(`token:${id}`, 300, '1'); // 5분 TTL
+  res.send(`${req.protocol}://${req.get('host')}/g/${id}`);
 });
 
-app.get('/g/:token', async (req, res) => {
-  const ok = await redis.del(`token:${req.params.token}`);
+// 토큰 검증 미들웨어
+app.get('/g/:id', async (req, res, next) => {
+  const ok = await redisClient.getDel(`token:${req.params.id}`);
   if (!ok) return res.status(404).send('링크 만료');
-  req.session.isSubscriber = true;
-  res.redirect('/access');
+  next();
 });
 
-app.get('/access', (req, res) => {
-  if (!req.session.isSubscriber) return res.status(403).send('구독자 전용');
-  res.redirect('https://chat.openai.com/g/XXXXXXXX');  // ← 당신의 GPT 주소로 교체
+// 실제 GPT 프록시 (예시)
+app.get('/g/:id', (req, res) => {
+  res.redirect('https://chat.openai.com'); // 필요 시 GPT 주소로 수정
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`Server listening on ${port}`));
+
 });
 
 app.listen(process.env.PORT || 3000);
